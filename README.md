@@ -1,5 +1,8 @@
 <h1 align="center">Inlyne - a GPU powered, browserless, markdown + html viewer</h1>
 
+> Personal fork with opt-in keyboard link hints and tested daily upstream merges.
+> See [fork maintenance](FORK.md) for automation, notifications and local updates.
+
 <p align="center">
   <!-- Crates.io -->
   <a href="https://crates.io/crates/inlyne">

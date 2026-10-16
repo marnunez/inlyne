@@ -1,0 +1,221 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'marnunez/inlyne' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      base: ${{ steps.plan.outputs.base }}
+      upstream: ${{ steps.plan.outputs.upstream }}
+      previous: ${{ steps.plan.outputs.previous }}
+      changed: ${{ steps.plan.outputs.changed }}
+      candidate: ${{ steps.merge.outputs.candidate }}
+      workflow_changes: ${{ steps.merge.outputs.workflow_changes }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      RUSTFLAGS: '-C debuginfo=0'
+      RUSTONIG_SYSTEM_LIBONIG: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for upstream commits
+        id: plan
+        shell: bash
+        run: |
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git remote add upstream https://github.com/Inlyne-Project/inlyne.git
+          git fetch --no-tags upstream main
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "previous=$(git merge-base HEAD "$upstream")" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge in a temporary checkout
+        id: merge
+        if: steps.plan.outputs.changed == 'true'
+        env:
+          UPSTREAM_SHA: ${{ steps.plan.outputs.upstream }}
+          BASE_SHA: ${{ steps.plan.outputs.base }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-ff --no-edit "$UPSTREAM_SHA"
+          echo "candidate=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if git diff --quiet "$BASE_SHA" HEAD -- .github/workflows; then
+            echo 'workflow_changes=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'workflow_changes=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        if: steps.plan.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libxkbcommon-dev libwayland-dev \
+            libssl-dev libonig-dev fonts-dejavu-core
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: steps.plan.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          prefix-key: upstream-sync
+
+      - name: Validate the merged tree
+        if: steps.plan.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- --deny warnings
+          cargo build --workspace --locked
+          git diff --exit-code HEAD
+
+      - name: Bundle the tested commit
+        if: steps.plan.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.plan.outputs.base }}
+        run: git bundle create "$RUNNER_TEMP/upstream-sync.bundle" "$BASE_SHA..HEAD"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: steps.plan.outputs.changed == 'true'
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/upstream-sync.bundle
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: check
+    if: always() && github.repository == 'marnunez/inlyne' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    env:
+      WORKFLOW_TOKEN_AVAILABLE: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+    steps:
+      # This job never executes code from the candidate tree with a write token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: needs.check.result == 'success' && needs.check.outputs.changed == 'true' && (needs.check.outputs.workflow_changes != 'true' || env.WORKFLOW_TOKEN_AVAILABLE == 'true')
+        with:
+          ref: ${{ needs.check.outputs.base }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.check.result == 'success' && needs.check.outputs.changed == 'true' && (needs.check.outputs.workflow_changes != 'true' || env.WORKFLOW_TOKEN_AVAILABLE == 'true')
+        with:
+          name: upstream-sync
+          path: ${{ runner.temp }}/upstream-sync
+
+      - name: Publish the tested merge
+        id: push
+        if: needs.check.result == 'success' && needs.check.outputs.changed == 'true' && (needs.check.outputs.workflow_changes != 'true' || env.WORKFLOW_TOKEN_AVAILABLE == 'true')
+        env:
+          BASE_SHA: ${{ needs.check.outputs.base }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream }}
+          CANDIDATE_SHA: ${{ needs.check.outputs.candidate }}
+        run: |
+          git fetch "$RUNNER_TEMP/upstream-sync/upstream-sync.bundle" HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^1")" = "$BASE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^2")" = "$UPSTREAM_SHA"
+          git fetch --no-tags origin main
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git push origin "$CANDIDATE_SHA:refs/heads/main"
+
+      # This must not prevent a validated merge from being published.
+      - name: Keep this workflow enabled
+        id: keepalive
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sync-upstream.yml/enable"
+
+      - name: Notify the sync log
+        if: always() && (needs.check.result != 'success' || needs.check.outputs.changed == 'true' || github.event_name == 'workflow_dispatch' || steps.keepalive.outcome == 'failure')
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          SYNC_ISSUE: ${{ vars.UPSTREAM_SYNC_ISSUE }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          CHANGED: ${{ needs.check.outputs.changed }}
+          UPSTREAM_SHA: ${{ needs.check.outputs.upstream }}
+          PREVIOUS_SHA: ${{ needs.check.outputs.previous }}
+          CANDIDATE_SHA: ${{ needs.check.outputs.candidate }}
+          PUSH_RESULT: ${{ steps.push.outcome }}
+          WORKFLOW_CHANGES: ${{ needs.check.outputs.workflow_changes }}
+          KEEPALIVE_RESULT: ${{ steps.keepalive.outcome }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const number = Number(process.env.SYNC_ISSUE);
+            if (!Number.isInteger(number) || number < 1) {
+              throw new Error('Set the UPSTREAM_SYNC_ISSUE repository variable to the sync-log issue number');
+            }
+            const upstream = process.env.UPSTREAM_SHA;
+            const previous = process.env.PREVIOUS_SHA;
+            const changed = process.env.CHANGED === 'true';
+            const keepaliveFailed = process.env.KEEPALIVE_RESULT === 'failure';
+            const workflowBlocked = process.env.WORKFLOW_CHANGES === 'true'
+              && process.env.WORKFLOW_TOKEN_AVAILABLE !== 'true';
+            const status = process.env.CHECK_RESULT !== 'success' ? 'blocked'
+              : changed ? (workflowBlocked ? 'needs-manual'
+                : process.env.PUSH_RESULT === 'success' ? 'updated' : 'publish-failed')
+              : keepaliveFailed ? 'keepalive-failed' : 'up-to-date';
+            const marker = `<!-- upstream-sync:${upstream || 'unknown'}:${status}:${keepaliveFailed} -->`;
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) { comments(last: 20) { nodes { body author { login } } } }
+                }
+              }`, {owner, repo, number});
+            const last = result.repository.issue.comments.nodes.filter(comment =>
+              ['github-actions', 'github-actions[bot]'].includes(comment.author?.login)
+              && comment.body.startsWith('<!-- upstream-sync:')).at(-1);
+            if (last?.body.startsWith(marker) && context.eventName !== 'workflow_dispatch') {
+              core.info('This upstream result was already reported');
+              return;
+            }
+            const messages = {
+              blocked: 'Upstream merge or validation failed. No upstream update was published.',
+              updated: 'Upstream changes merged; formatting, tests, Clippy and build passed.',
+              'needs-manual': 'Validation passed, but upstream modifies GitHub workflow files. The built-in token cannot publish these changes; merge manually or configure UPSTREAM_SYNC_TOKEN.',
+              'publish-failed': 'Validation passed, but publishing failed. No force-push was attempted; check the logs for a concurrent update or permission error.',
+              'keepalive-failed': 'Could not keep the daily schedule enabled; see the workflow logs.',
+              'up-to-date': 'Already up to date; manual validation passed.'
+            };
+            const lines = [marker, '@marnunez', '', `**${messages[status]}**`];
+            if (upstream) lines.push('', `Upstream: https://github.com/Inlyne-Project/inlyne/commit/${upstream}`);
+            if (previous && upstream && previous !== upstream) {
+              lines.push(`Changes: https://github.com/Inlyne-Project/inlyne/compare/${previous}...${upstream}`);
+            }
+            if (status === 'updated') lines.push(`Merge: https://github.com/${owner}/${repo}/commit/${process.env.CANDIDATE_SHA}`);
+            if (keepaliveFailed && status !== 'keepalive-failed') lines.push('', 'Warning: the schedule keepalive failed; check the logs.');
+            lines.push('', `[Workflow logs](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId})`);
+            await github.rest.issues.createComment({owner, repo, issue_number: number, body: lines.join('\n')});
